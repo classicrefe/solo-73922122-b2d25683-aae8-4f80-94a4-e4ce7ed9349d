@@ -7,7 +7,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import asyncpg
 
-from .csvutil import ParsedCsv
+from .config import settings
+from .csvutil import ParsedCsv, median_nm
+from .revision import compute_revision, validate_replacement_wafer_set
 from .storage import StoredArtifact
 
 # Unique constraint backing per-device accept_seq (see schema.py).  Concurrent
@@ -146,6 +148,146 @@ def _brief(row: asyncpg.Record) -> Dict[str, Any]:
         "accept_seq": row["accept_seq"],
         "status": row["status"],
     }
+
+
+class RevisionRequestError(Exception):
+    """A simulation request that cannot be answered with a sound snapshot."""
+
+    def __init__(self, message: str, status_code: int = 409,
+                 details: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.details = details or {}
+
+
+_SNAPSHOT_SQL = """
+    SELECT id, batch_no, device_id, accept_seq, status, median_nm,
+           ref_mean_nm, deviation_nm, reference_ids
+      FROM batches
+     WHERE device_id = $1
+     ORDER BY accept_seq
+"""
+
+
+async def simulate_revision(
+    pool: asyncpg.pool.Pool,
+    *,
+    device_id: str,
+    batch_no: str,
+    parsed: ParsedCsv,
+) -> Dict[str, Any]:
+    """Replay the committed decision chain with a revised target thickness.
+
+    Everything is read inside one ``REPEATABLE READ`` read-only transaction, so
+    the report describes a single point-in-time snapshot: decisions committed
+    concurrently after that snapshot are invisible, and the cutoff batch number
+    in the response pins down exactly how far the snapshot reaches.  Nothing is
+    written -- not the original CSV, not any decision row, not the data-lake
+    read model.
+    """
+    async with pool.acquire() as conn:
+        tx = conn.transaction(isolation="repeatable_read", readonly=True)
+        async with tx:
+            rows = await conn.fetch(_SNAPSHOT_SQL, device_id)
+            target = next((r for r in rows if r["batch_no"] == batch_no), None)
+            if target is None:
+                raise RevisionRequestError(
+                    f"设备 {device_id} 下无此批号 / batch not found for device: "
+                    f"{batch_no}", status_code=404)
+            if target["status"] == "PENDING":
+                raise RevisionRequestError(
+                    f"批号 {batch_no} 尚未判定，不能作为试算基准 / "
+                    "target batch has no committed decision yet", status_code=409)
+
+            decided = [r for r in rows if r["status"] != "PENDING"]
+            # The worker decides strictly in accept_seq order, so committed
+            # decisions must form the contiguous prefix 1..cutoff.  Anything
+            # else means the snapshot is not a valid replay base.
+            if [int(r["accept_seq"]) for r in decided] != \
+                    list(range(1, len(decided) + 1)):
+                raise RevisionRequestError(
+                    "设备判定序列不连续，无法构造一致快照 / "
+                    "decision sequence is not a contiguous prefix",
+                    status_code=409)
+            if any(r["median_nm"] is None for r in decided):
+                raise RevisionRequestError(
+                    "快照中存在缺少中位数的已判定批 / snapshot contains a "
+                    "decided batch without median", status_code=409)
+
+            cutoff = decided[-1]
+            followups = int(cutoff["accept_seq"]) - int(target["accept_seq"])
+            limit = settings.revision_max_followup_batches
+            if followups > limit:
+                # Explicit refusal: never return a truncated report.
+                raise RevisionRequestError(
+                    f"目标批之后有 {followups} 个已判定批，超过上限 {limit}，"
+                    "拒绝试算 / too many decided batches after the target; "
+                    "simulation refused rather than truncated",
+                    status_code=409,
+                    details={"decided_after_target": followups,
+                             "max_decided_after_target": limit,
+                             "snapshot_cutoff_batch_no": cutoff["batch_no"]},
+                )
+
+            original_wafers = await conn.fetch(
+                "SELECT wafer_no, thickness_nm FROM wafer_measurements "
+                "WHERE batch_id = $1", target["id"])
+            try:
+                validate_replacement_wafer_set(
+                    [w["wafer_no"] for w in original_wafers], parsed.rows)
+            except ValueError as exc:  # WaferSetMismatch
+                raise RevisionRequestError(
+                    str(exc), status_code=400,
+                    details={"missing_wafer_nos": getattr(exc, "missing", []),
+                             "extra_wafer_nos": getattr(exc, "extra", [])},
+                ) from exc
+
+            snapshot = [
+                {
+                    "id": r["id"],
+                    "batch_no": r["batch_no"],
+                    "accept_seq": r["accept_seq"],
+                    "status": r["status"],
+                    "median_nm": float(r["median_nm"]),
+                    "ref_mean_nm": (float(r["ref_mean_nm"])
+                                    if r["ref_mean_nm"] is not None else None),
+                    "deviation_nm": (float(r["deviation_nm"])
+                                     if r["deviation_nm"] is not None else None),
+                    "reference_ids": [int(i) for i in (r["reference_ids"] or [])],
+                }
+                for r in decided
+            ]
+
+            revised_median = median_nm([t for _, t in parsed.rows])
+            result = compute_revision(
+                snapshot,
+                target_seq=int(target["accept_seq"]),
+                revised_median_nm=revised_median,
+                baseline_count=settings.baseline_count,
+                reference_count=settings.reference_count,
+                threshold_nm=settings.drift_threshold_nm,
+            )
+
+            return {
+                "device_id": device_id,
+                "target_batch_no": batch_no,
+                "target_accept_seq": int(target["accept_seq"]),
+                "original_median_nm": float(target["median_nm"]),
+                "revised_median_nm": revised_median,
+                "threshold_nm": settings.drift_threshold_nm,
+                "baseline_count": settings.baseline_count,
+                "reference_count": settings.reference_count,
+                "snapshot_cutoff_batch_no": cutoff["batch_no"],
+                "snapshot_cutoff_accept_seq": int(cutoff["accept_seq"]),
+                "decided_after_target": followups,
+                "evaluated_count": result["evaluated_count"],
+                "target_result": result["target"],
+                "changed_count": result["changed_count"],
+                "changed_batches": result["changed_batches"],
+                # The endpoint is read-only by construction; stated explicitly
+                # so operators can see that nothing was mutated.
+                "applied": False,
+            }
 
 
 async def get_batch_detail(pool: asyncpg.pool.Pool,

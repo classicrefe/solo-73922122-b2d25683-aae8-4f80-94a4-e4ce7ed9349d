@@ -8,10 +8,12 @@
 #   1. strict intake + idempotent retry / conflicting-content rejection;
 #   2. the drift rule (first three released, then a >5nm drift is quarantined,
 #      quarantined batches never enter the reference window);
-#   3. slow head-of-line batch: same-device FIFO, other devices unaffected;
-#   4. container crash: `docker stop`-like failure mid-batch, survivor takes
+#   3. thickness-revision impact simulation (read-only replay from a committed
+#      snapshot; a flipped verdict propagates to later batches);
+#   4. slow head-of-line batch: same-device FIFO, other devices unaffected;
+#   5. container crash: `docker stop`-like failure mid-batch, survivor takes
 #      over with no half batch and no double reference advancement;
-#   5. the data endpoint serves released batches only.
+#   6. the data endpoint serves released batches only.
 set -euo pipefail
 
 BASE="${BASE:-http://localhost:8080}"
@@ -61,7 +63,28 @@ post DEMO-B1 "$DEV" /tmp/demo_d1.csv | j | grep -E 'reused_retry|status'
 csv DIFF 501 5 > /tmp/demo_diff.csv
 echo "conflict http status: $(post DEMO-B1 "$DEV" /tmp/demo_diff.csv | tail -1)"
 
-echo; echo "== 4. slow head-of-line batch on $DEV-SLOW (other device flows) =="
+echo; echo "== 4. thickness-revision impact simulation (read-only) =="
+REVDEV="${DEV}-REV"
+for n in 1 2 3 4 5; do
+  case "$n" in 4|5) t=506 ;; *) t=500 ;; esac
+  csv "RV$n" "$t" 5 > "/tmp/rv$n.csv"
+  post "REV-B$n" "$REVDEV" "/tmp/rv$n.csv" >/dev/null
+done
+for n in 1 2 3 4 5; do echo "  REV-B$n -> $(wait_decided "REV-B$n")"; done
+# Revise B4 from 506 to 505: B4 flips Q->R, and B5 (which then sees B4 in its
+# reference window) flips Q->R as well.  Wafer numbers must stay identical, so
+# the replacement reuses the original prefix.
+csv RV4 505 5 > /tmp/rv4_revised.csv
+echo "  simulation (revise REV-B4 to 505):"
+curl -sS -X POST "$BASE/devices/$REVDEV/batches/REV-B4/revision-simulation" \
+  -F "file=@/tmp/rv4_revised.csv;type=text/csv" | j |
+  python3 -c 'import sys,json;d=json.load(sys.stdin);print(json.dumps({k:d[k] for k in ("snapshot_cutoff_batch_no","changed_count","applied")},ensure_ascii=False));[print("   ",c["batch_no"],c["actual_status"],"->",c["simulated_status"],"refs",c["actual_reference_batch_nos"],"->",c["simulated_reference_batch_nos"]) for c in d["changed_batches"]]'
+# Wafer numbers must match the original batch exactly (4 instead of 5 -> 400).
+csv RV4 505 4 > /tmp/rv4_bad.csv
+echo "  wafer-set mismatch http status: $(curl -sS -o /dev/null -w '%{http_code}' -X POST "$BASE/devices/$REVDEV/batches/REV-B4/revision-simulation" -F "file=@/tmp/rv4_bad.csv;type=text/csv")"
+echo "  committed verdicts unchanged: REV-B4=$(status_of REV-B4), REV-B5=$(status_of REV-B5)"
+
+echo; echo "== 5. slow head-of-line batch on $DEV-SLOW (other device flows) =="
 SLOWDEV="${DEV}-SLOW"; OTHERDEV="${DEV}-OTHER"
 csv S1 500 5 > /tmp/s1.csv; csv S2 500 5 > /tmp/s2.csv
 csv O1 700 5 > /tmp/o1.csv; csv O2 700 5 > /tmp/o2.csv
@@ -76,7 +99,7 @@ echo "  while SLOW-1 pending: SLOW-1=$(status_of SLOW-1), OTHER-2=$(status_of OT
 echo "  SLOW-1 -> $(wait_decided SLOW-1), SLOW-2 -> $(wait_decided SLOW-2)"
 docker compose exec -T api1 sh -c 'rm -f /data/raw/slow_batches.txt'
 
-echo; echo "== 5. container crash mid-batch and survivor takeover =="
+echo; echo "== 6. container crash mid-batch and survivor takeover =="
 CDEV="${DEV}-CRASH"
 # Ingest four batches first while both instances are up; the crash marker is
 # only written afterwards so ingestion itself never crashes.
@@ -101,7 +124,7 @@ for b in CRASH-1 CRASH-2 CRASH-3 CRASH-4; do echo "  $b -> $(wait_decided "$b")"
 echo "  final decision + references for the post-baseline batch CRASH-4:"
 curl -sS "$BASE/batches/CRASH-4" | j
 
-echo; echo "== 6. data lake endpoint hides quarantined batches =="
+echo; echo "== 7. data lake endpoint hides quarantined batches =="
 curl -sS "$BASE/data/released?device_id=$DEV" | j | grep -E 'total_released|batch_no'
 echo
 echo "OpenAPI docs: $BASE/docs"

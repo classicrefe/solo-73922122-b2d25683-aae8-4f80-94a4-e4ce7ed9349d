@@ -1,9 +1,12 @@
-"""End-to-end demonstration of the two reliability guarantees.
+"""End-to-end demonstration of the reliability guarantees.
 
 1. SLOW BATCH: a slow head-of-line batch cannot be overtaken by later
    batches of the same device, while another device and the HTTP API keep
    responding.
-2. CRASH TAKEOVER: a worker process that hard-exits mid-batch leaves no half
+2. REVISION SIMULATION: a read-only replay from a committed decision snapshot
+   shows which verdicts would change; a flipped verdict changes the reference
+   window of later batches.  Nothing is persisted.
+3. CRASH TAKEOVER: a worker process that hard-exits mid-batch leaves no half
    state; the surviving instance picks up the PENDING batch and finishes it.
 
 Local run (two uvicorn instances against an embedded PostgreSQL)::
@@ -74,6 +77,23 @@ def upload(port: str, batch_no: str, device: str, thickness: int,
     return http("POST", f"http://127.0.0.1:{port}/batches",
                 b"".join(parts),
                 f"multipart/form-data; boundary={boundary}")
+
+
+def simulate_revision(port: str, device: str, batch_no: str,
+                      rows: list[tuple[str, int]]) -> tuple[int, dict]:
+    """Upload a replacement CSV for the read-only revision simulation."""
+    boundary = f"----fab{uuid.uuid4().hex}"
+    csv = ("wafer_no,thickness_nm\n" +
+           "\n".join(f"{w},{t}" for w, t in rows) + "\n").encode()
+    body = (
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; "
+        f"filename=\"revised.csv\"\r\nContent-Type: text/csv\r\n\r\n"
+    ).encode() + csv + b"\r\n" + f"--{boundary}--\r\n".encode()
+    return http(
+        "POST",
+        f"http://127.0.0.1:{port}/devices/{device}/batches/{batch_no}"
+        "/revision-simulation",
+        body, f"multipart/form-data; boundary={boundary}")
 
 
 def wait_status(port: str, batch_no: str, timeout: float = 40.0) -> dict:
@@ -200,7 +220,50 @@ def main() -> int:
     assert [x["accept_seq"] for x in (f1_done, f2, f3)] == [1, 2, 3]
     print("  PASS: same-device FIFO preserved, other device never blocked")
 
-    print("\n=== DEMO 2: worker crash then survivor takeover ===")
+    print("\n=== DEMO 2: thickness-revision impact simulation ===")
+    dev_r = f"R-{run}"
+    rev_names = []
+    for i, median in enumerate([500, 500, 500, 506, 506], start=1):
+        batch_no = f"{run}-R{i}"
+        code, _ = upload(port1 if i % 2 else port2, batch_no, dev_r, median)
+        assert code == 202
+        rev_names.append(batch_no)
+    decisions = [wait_status(port1, b) for b in rev_names]
+    actual = [d["status"] for d in decisions]
+    print(f"  committed: {list(zip(rev_names, actual))}")
+    assert actual == ["RELEASED", "RELEASED", "RELEASED",
+                      "QUARANTINED", "QUARANTINED"]
+
+    revised_rows = [(f"{run}-R4-W{i:03d}", 505) for i in range(1, 6)]
+    code, sim = simulate_revision(port2, dev_r, f"{run}-R4", revised_rows)
+    assert code == 200, sim
+    print(f"  snapshot cutoff={sim['snapshot_cutoff_batch_no']} "
+          f"changed={sim['changed_count']} applied={sim['applied']}")
+    for c in sim["changed_batches"]:
+        print(f"    {c['batch_no']}: {c['actual_status']} -> "
+              f"{c['simulated_status']} refs {c['actual_reference_batch_nos']}"
+              f" -> {c['simulated_reference_batch_nos']} "
+              f"dev {c['actual_deviation_nm']} -> {c['simulated_deviation_nm']}")
+    assert [c["batch_no"] for c in sim["changed_batches"]] == \
+        [f"{run}-R4", f"{run}-R5"]
+    # The flipped R4 becomes R5's reference -> its reference set changes.
+    assert sim["changed_batches"][1]["simulated_reference_batch_nos"] == \
+        [f"{run}-R2", f"{run}-R3", f"{run}-R4"]
+
+    # Wafer numbers must match exactly; only thickness may change.
+    code, bad = simulate_revision(port2, dev_r, f"{run}-R4", revised_rows[:-1])
+    print(f"  wafer-set mismatch -> http {code} (expected 400)")
+    assert code == 400 and bad["missing_wafer_nos"] == [f"{run}-R4-W005"]
+
+    # Nothing was mutated: verdicts and the data lake read model are identical.
+    after = [wait_status(port1, b)["status"] for b in rev_names]
+    assert after == actual
+    _, released = http("GET", f"http://127.0.0.1:{port1}/data/released"
+                              f"?device_id={dev_r}")
+    assert released["total_released"] == 3
+    print("  PASS: simulation is read-only; changed verdicts would propagate")
+
+    print("\n=== DEMO 3: worker crash then survivor takeover ===")
     dev_k = f"K-{run}"
     # Stop the regular workers so we control who processes the K device.
     api1.shutdown(); api2.shutdown()

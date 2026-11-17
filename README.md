@@ -32,19 +32,20 @@
 
 ```
 app/
-  config.py     环境变量配置与判定常量（前3批/参考3批/阈值5nm）
+  config.py     环境变量配置与判定常量（前3批/参考3批/阈值5nm/试算上限）
   schema.py     PostgreSQL 表结构
   db.py         asyncpg 连接池 + jsonb codec
   csvutil.py    严格 CSV 解析（1~1000片、片号批内唯一、厚度正整数）
   storage.py    原件内容寻址持久化（tmp+fsync+原子rename）
-  service.py    受理（幂等/冲突）、查询、供数读模型
+  service.py    受理（幂等/冲突）、查询、供数读模型、修订影响试算
+  revision.py   纯函数判定重放（试算核心，无 IO）
   worker.py     后台判定 worker（设备咨询锁 + 单事务原子判定）
   main.py       FastAPI 路由、生命周期（每实例启动一个 worker）
 scripts/
   worker_harness.py  单实例 worker 驱动（提交/慢批/崩溃标记/空闲退出）
   demo_local.py      本地双实例端到端演示（便携 Postgres）
-  demo_compose.sh    Docker Compose 栈演示
-tests/          pytest：CSV、API 规则、双 worker 并发、崩溃恢复（23 个）
+  demo_compose.sh    Docker Compose 栈演示（含修订影响试算）
+tests/          pytest：CSV、API 规则、双 worker 并发、崩溃恢复、修订试算
 deploy/nginx/   双实例轮询负载均衡
 docker-compose.yml  db + api1 + api2 + nginx
 ```
@@ -53,9 +54,9 @@ docker-compose.yml  db + api1 + api2 + nginx
 
 ```bash
 docker compose up --build -d
-# API 文档（Swagger UI）
+# API 文档（Swagger UI，可直接提交修订影响试算）
 open http://localhost:8080/docs
-# 端到端演示：受理/幂等/漂移/慢批FIFO/容器崩溃接续/供数隔离
+# 端到端演示：受理/幂等/漂移/修订影响试算/慢批FIFO/容器崩溃接续/供数隔离
 bash scripts/demo_compose.sh
 ```
 
@@ -70,7 +71,7 @@ pip install -r requirements.txt pgserver pytest pytest-asyncio httpx python-mult
 # 启动一个便携 PostgreSQL 并导出 DSN，然后：
 export DATABASE_DSN=...          # 见 scripts/start_test_db.py
 uvicorn app.main:app --port 8000 # 可启动第二个实例换端口即可
-python -m scripts.demo_local     # 慢批 + 崩溃接续完整演示
+python -m scripts.demo_local     # 慢批 + 修订试算 + 崩溃接续完整演示
 ```
 
 ## API 摘要
@@ -80,9 +81,40 @@ python -m scripts.demo_local     # 慢批 + 崩溃接续完整演示
 | `POST /batches` | multipart：`batch_no`、`device_id`、`file`(CSV)；成功 `202`，校验失败 `400`，冲突 `409` |
 | `GET /batches/{batch_no}` | 判定结果、中位数、偏差、参考批号、原件路径、尝试次数、决定实例 |
 | `GET /devices/{device_id}/batches` | 按设备列受理顺序与状态 |
+| `POST /devices/{device_id}/batches/{batch_no}/revision-simulation` | **厚度修订影响试算**：multipart `file`(替代 CSV)；只读，返回结论变化批号与参考/偏差对比 |
 | `GET /data/released` | 供数接口，**仅放行**批的晶圆明细，支持 device/batch 过滤与分页 |
 | `GET /health` | 存活与数据库连通性 |
 | `POST /internal/shutdown?token=` | 仅演示用；未设 `SHUTDOWN_TOKEN` 时返回 404，不出现在 OpenAPI |
+
+## 厚度修订影响试算
+
+校准设备后，质控工程师可上传替代 CSV，评估“若某个已判定批的厚度是修订后的值，
+哪些批的放行/隔离结论会变”。接口：
+`POST /devices/{device_id}/batches/{batch_no}/revision-simulation`（`/docs` 可直接提交）。
+
+* **输入约束**：目标批必须是该设备下**已判定**的批；替代 CSV 晶圆号必须与原批
+  **完全一致**（集合相等），只能改厚度；否则 `400`。批号不属于该设备或不存在 →
+  `404`；目标批仍 `PENDING` → `409`。
+* **快照**：整个试算在**一个 `REPEATABLE READ` 只读事务**内读取该设备全部已提交
+  判定，报告只描述这一个时间点；试算期间其他实例并发提交的新判定**不会混入**
+  （事务快照隔离）。快照截止批号 `snapshot_cutoff_batch_no` /
+  `snapshot_cutoff_accept_seq` 明确报告覆盖到哪里。
+* **重放规则**：目标批之前按已提交事实；从目标批起按原规则重算——前 3 批直接
+  放行，其后与“最近 3 个**试算后**已放行批”的中位数均值比较，偏差 > 5nm 隔离。
+  **前批改判会改变后批的参考窗口**，因此改判会向后传播（例如隔离→放行后，该批
+  进入后一批的参考集，使后一批偏差变化甚至改判）。
+* **返回**：`changed_batches` 逐条给出 `batch_no`、`actual_status` /
+  `simulated_status`、`actual_reference_batch_nos` /
+  `simulated_reference_batch_nos`、两组 `reference_mean_nm` 与 `deviation_nm`；
+  `target_result` 给出目标批自身的前后对比；`applied=false` 表示纯试算。
+* **规模上限**：目标批之后已有**超过 50 个**已判定批时返回 `409` 并说明
+  `decided_after_target` / `max_decided_after_target`，**绝不返回截断结果**。
+  上限可用 `REVISION_MAX_FOLLOWUP_BATCHES` 调整。
+* **只读保证**：试算不写数据库（只读事务）、不落盘替代文件（不做原件的
+  content-addressed 持久化）、不改变实际判定与 `/data/released` 供数结果。
+
+示例：`curl -F "file=@revised.csv" \
+  "http://localhost:8080/devices/EQ-1/batches/BATCH-0004/revision-simulation"`
 
 ### CSV 格式
 
@@ -99,10 +131,14 @@ W002,508
 ```bash
 DATABASE_DSN=<postgres dsn> python -m pytest -q
 ```
-28 个用例覆盖：CSV 边界与非法输入、前三批基线、>5nm 隔离与临界 5nm 放行、
+42 个用例覆盖：CSV 边界与非法输入、前三批基线、>5nm 隔离与临界 5nm 放行、
 隔离批不进参考窗、滚动窗口滑动、幂等重试与 409 冲突、供数不可见隔离批、
 双 worker 同设备 FIFO 与跨设备并行、小连接池下高并发同设备受理无死锁（回归）、
-真实子进程硬退出后的接续与无半批。
+真实子进程硬退出后的接续与无半批，以及修订影响试算：判定重放纯函数（临界
+5nm、级联改判、隔离批不入窗）、改判向后传播、参考窗口与实际/试算对比、
+晶圆号不一致拒绝、目标批 PENDING/不存在、50 批上限（之后 50 个已判定批允许、
+51 个拒绝且不截断）、试算期间并发提交的判定不混入报告、试算只读（原件/判定/供数不变、
+替代文件不落盘）。
 
 ## 演示中的慢批/崩溃钩子（仅测试用途）
 

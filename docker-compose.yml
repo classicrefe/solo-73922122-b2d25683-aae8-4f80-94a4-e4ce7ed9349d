@@ -25,6 +25,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-fab}
       STORAGE_DIR: /data/raw
       SLOW_MARKER_FILE: /data/raw/slow_batches.txt
+      REVISION_MAX_FOLLOWUP_BATCHES: ${REVISION_MAX_FOLLOWUP_BATCHES:-50}
     volumes:
       - rawdata:/data/raw
     depends_on:
@@ -42,6 +43,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-fab}
       STORAGE_DIR: /data/raw
       SLOW_MARKER_FILE: /data/raw/slow_batches.txt
+      REVISION_MAX_FOLLOWUP_BATCHES: ${REVISION_MAX_FOLLOWUP_BATCHES:-50}
     volumes:
       - rawdata:/data/raw
     depends_on:

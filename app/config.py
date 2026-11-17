@@ -40,6 +40,10 @@ class Settings:
     baseline_count: int = 3          # first N accepted batches per device are released
     reference_count: int = 3         # compare against the N most recent released batches
     drift_threshold_nm: float = 5.0  # strictly greater than this => quarantine
+    # Revision impact simulation: refuse (never truncate) when more than this
+    # many already-decided batches follow the revised target batch.
+    revision_max_followup_batches: int = int(
+        os.environ.get("REVISION_MAX_FOLLOWUP_BATCHES", "50"))
 
     @property
     def crash_marker_file(self) -> str:

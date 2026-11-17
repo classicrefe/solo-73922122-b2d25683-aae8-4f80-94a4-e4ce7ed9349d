@@ -9,7 +9,16 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Path,
+    Query,
+    UploadFile,
+    status,
+)
 from fastapi.responses import JSONResponse
 
 from .config import settings
@@ -17,10 +26,12 @@ from .csvutil import CsvValidationError, parse_thickness_csv
 from .db import close_pool, create_pool
 from .service import (
     ConflictError,
+    RevisionRequestError,
     accept_submission,
     get_batch_detail,
     get_released_data,
     list_device_batches,
+    simulate_revision,
 )
 from .storage import persist_original
 from .worker import DecisionWorker
@@ -69,6 +80,14 @@ async def _conflict_handler(_request, exc: ConflictError):
     return JSONResponse(
         status_code=409,
         content={"error": str(exc), "existing": exc.existing},
+    )
+
+
+@app.exception_handler(RevisionRequestError)
+async def _revision_error_handler(_request, exc: RevisionRequestError):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": str(exc), **exc.details},
     )
 
 
@@ -135,6 +154,40 @@ async def query_batch(batch_no: str):
 async def device_batches(device_id: str):
     rows = await list_device_batches(get_pool_safe(), device_id)
     return {"device_id": device_id, "count": len(rows), "batches": rows}
+
+
+@app.post(
+    "/devices/{device_id}/batches/{batch_no}/revision-simulation",
+    summary="厚度修订影响试算（只读，不改变任何已提交判定）",
+    description=(
+        "上传与原批晶圆号完全一致、仅厚度可变的替代 CSV，按同一已提交判定"
+        "快照从目标批起重放判定规则：前 3 批直接放行，其后与最近 3 个"
+        "（试算后）已放行批中位数均值比较，偏差 > 5nm 隔离。\n\n"
+        "返回结论发生变化的批号及其实际/试算参考批号与偏差，以及快照截止"
+        "批号。若目标批之后已判定批超过 50 个则拒绝试算并返回 409，绝不返回"
+        "截断结果。试算只读：不改原件、不改实际判定、不影响供数。"
+    ),
+    response_model=None,
+)
+async def revision_simulation(
+    device_id: str = Path(..., description="设备号"),
+    batch_no: str = Path(..., description="该设备下已判定的目标批号"),
+    file: UploadFile = File(..., description="替代 CSV：晶圆号,厚度nm"),
+):
+    device_id = device_id.strip()
+    batch_no = batch_no.strip()
+    if not device_id or not batch_no:
+        raise HTTPException(400, "device_id 与 batch_no 不能为空 / required")
+
+    raw = await file.read()
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, "CSV 超过 8MB 上限 / file too large")
+    parsed = parse_thickness_csv(raw)  # 400 on structural violations
+
+    # Note: the replacement bytes are deliberately NOT persisted; the
+    # simulation must not create any durable artifact.
+    return await simulate_revision(
+        get_pool_safe(), device_id=device_id, batch_no=batch_no, parsed=parsed)
 
 
 @app.get("/data/released", summary="数据湖供数接口（仅放行明细，隔离批不可见）")
